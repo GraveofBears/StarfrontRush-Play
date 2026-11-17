@@ -31,10 +31,23 @@
   <script>
     const canvas = document.querySelector("#unity-canvas");
     const fill = document.querySelector("#fill"), loading = document.querySelector("#loading"), note = document.querySelector("#note");
+    // two builds: desktop textures (DXT, in Build/) and phone textures (ASTC, in BuildPhone/). A browser that can't draw
+    // DXT but can draw ASTC (most phones) takes the phone build, so nothing has to be unpacked in full
+    const PHONE = (() => {
+      try {
+        const gl = document.createElement("canvas").getContext("webgl2");
+        if (!gl) return false;
+        const dxt = gl.getExtension("WEBGL_compressed_texture_s3tc");
+        const astc = gl.getExtension("WEBGL_compressed_texture_astc");
+        return !dxt && !!astc;
+      } catch (e) { return false; }
+    })();
+    const DIR = PHONE ? "BuildPhone/" : "Build/";
+    const NAME = (f) => PHONE ? f.replace(/^Web\./, "WebPhone.") : f;
     const config = {
-      dataUrl: "Build/Web.data.unityweb",
-      frameworkUrl: "Build/Web.framework.js.unityweb",
-      codeUrl: "Build/Web.wasm.unityweb",
+      dataUrl: DIR + NAME("Web.data.unityweb"),
+      frameworkUrl: DIR + NAME("Web.framework.js.unityweb"),
+      codeUrl: DIR + NAME("Web.wasm.unityweb"),
       streamingAssetsUrl: "StreamingAssets",
       companyName: "DefaultCompany",
       productName: "Starfront Rush",
@@ -44,7 +57,7 @@
     // fetch them in order and join them into one blob for the loader (no parts.json: the normal single file)
     async function dataInParts() {
       let parts;
-      try { const r = await fetch("Build/parts.json", { cache: "no-cache" }); if (!r.ok) return false; parts = await r.json(); }
+      try { const r = await fetch(DIR + "parts.json", { cache: "no-cache" }); if (!r.ok) return false; parts = await r.json(); }
       catch (e) { return false; }
       // the parts are named by their content, so a part kept in the browser's cache storage from a visit
       // before is the same part: only new or changed parts are downloaded (old ones are cleared out)
@@ -55,7 +68,7 @@
       }
       const chunks = []; let got = 0;
       for (const name of parts.files) {
-        const url = "Build/" + name;
+        const url = DIR + name;
         let r = cache ? await cache.match(url) : null;
         const fresh = !r;
         if (fresh) {
@@ -79,7 +92,7 @@
       return true;
     }
     const script = document.createElement("script");
-    script.src = "Build/Web.loader.js";
+    script.src = DIR + NAME("Web.loader.js");
     script.onload = async () => {
       let split = false;
       try { split = await dataInParts(); } catch (e) { note.textContent = "Couldn't load: " + e.message; return; }
