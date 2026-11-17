@@ -40,10 +40,36 @@
       productName: "Starfront Rush",
       productVersion: "0.1.0",
     };
+    // GitHub refuses files over 100 MB, so a big data file is published in parts (Build/parts.json lists them):
+    // fetch them in order and join them into one blob for the loader (no parts.json: the normal single file)
+    async function dataInParts() {
+      let parts;
+      try { const r = await fetch("Build/parts.json", { cache: "no-cache" }); if (!r.ok) return false; parts = await r.json(); }
+      catch (e) { return false; }
+      const chunks = []; let got = 0;
+      for (const name of parts.files) {
+        const r = await fetch("Build/" + name, { cache: "no-cache" });
+        if (!r.ok) throw new Error("missing " + name);
+        const reader = r.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value); got += value.length;
+          fill.style.width = (80 * got / parts.size) + "%";
+          note.textContent = "loading " + Math.round(100 * got / parts.size) + "%";
+        }
+      }
+      config.dataUrl = URL.createObjectURL(new Blob(chunks));
+      config.cacheControl = () => "no-store";   // the blob isn't a server file the loader's cache can check
+      note.textContent = "starting...";
+      return true;
+    }
     const script = document.createElement("script");
     script.src = "Build/Web.loader.js";
-    script.onload = () => {
-      createUnityInstance(canvas, config, p => { fill.style.width = (100 * p) + "%"; })
+    script.onload = async () => {
+      let split = false;
+      try { split = await dataInParts(); } catch (e) { note.textContent = "Couldn't load: " + e.message; return; }
+      createUnityInstance(canvas, config, p => { fill.style.width = (split ? 80 + 20 * p : 100 * p) + "%"; })
         .then(() => { loading.style.display = "none"; })
         .catch(e => { note.textContent = "Couldn't start: " + e; });
     };
