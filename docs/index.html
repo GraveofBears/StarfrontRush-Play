@@ -46,18 +46,32 @@
       let parts;
       try { const r = await fetch("Build/parts.json", { cache: "no-cache" }); if (!r.ok) return false; parts = await r.json(); }
       catch (e) { return false; }
+      // the parts are named by their content, so a part kept in the browser's cache storage from a visit
+      // before is the same part: only new or changed parts are downloaded (old ones are cleared out)
+      let cache = null;
+      try { cache = await caches.open("starfront-data"); } catch (e) { cache = null; }
+      if (cache) {
+        try { for (const k of await cache.keys()) { const n = k.url.split("/").pop(); if (!parts.files.includes(n)) await cache.delete(k); } } catch (e) {}
+      }
       const chunks = []; let got = 0;
       for (const name of parts.files) {
-        const r = await fetch("Build/" + name, { cache: "no-cache" });
-        if (!r.ok) throw new Error("missing " + name);
+        const url = "Build/" + name;
+        let r = cache ? await cache.match(url) : null;
+        const fresh = !r;
+        if (fresh) {
+          r = await fetch(url);
+          if (!r.ok) throw new Error("missing " + name);
+        }
+        const keep = [];
         const reader = r.body.getReader();
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          chunks.push(value); got += value.length;
+          chunks.push(value); keep.push(value); got += value.length;
           fill.style.width = (80 * got / parts.size) + "%";
-          note.textContent = "loading " + Math.round(100 * got / parts.size) + "%";
+          note.textContent = (fresh ? "loading " : "loading (saved) ") + Math.round(100 * got / parts.size) + "%";
         }
+        if (fresh && cache) { try { await cache.put(url, new Response(new Blob(keep))); } catch (e) {} }
       }
       config.dataUrl = URL.createObjectURL(new Blob(chunks));
       config.cacheControl = () => "no-store";   // the blob isn't a server file the loader's cache can check
