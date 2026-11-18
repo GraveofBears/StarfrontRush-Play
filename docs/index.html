@@ -33,13 +33,19 @@
     const fill = document.querySelector("#fill"), loading = document.querySelector("#loading"), note = document.querySelector("#note");
     // two builds: desktop textures (DXT, in Build/) and phone textures (ASTC, in BuildPhone/). A browser that can't draw
     // DXT but can draw ASTC (most phones) takes the phone build, so nothing has to be unpacked in full
+    // which build this browser can draw: DXT (desktops) or ASTC (most phones). The test context is released after,
+    // and a device with neither (or no WebGL 2) gets a warning instead of a crash later
+    let OLD = false;
     const PHONE = (() => {
       try {
         const gl = document.createElement("canvas").getContext("webgl2");
-        if (!gl) return false;
-        const dxt = gl.getExtension("WEBGL_compressed_texture_s3tc");
-        const astc = gl.getExtension("WEBGL_compressed_texture_astc");
-        return !dxt && !!astc;
+        if (!gl) { OLD = true; return false; }
+        const dxt = !!gl.getExtension("WEBGL_compressed_texture_s3tc");
+        const astc = !!gl.getExtension("WEBGL_compressed_texture_astc");
+        const lose = gl.getExtension("WEBGL_lose_context");
+        if (lose) lose.loseContext();
+        if (!dxt && !astc) OLD = true;
+        return !dxt && astc;
       } catch (e) { return false; }
     })();
     const DIR = PHONE ? "BuildPhone/" : "Build/";
@@ -53,41 +59,96 @@
       productName: "Starfront Rush",
       productVersion: "0.1.0",
     };
-    // GitHub refuses files over 100 MB, so a big data file is published in parts (Build/parts.json lists them):
-    // fetch them in order and join them into one blob for the loader (no parts.json: the normal single file)
+    // GitHub refuses files over 100 MB, so the data is published in parts (<dir>/parts.json lists them, with sizes).
+    // Each part comes from the browser's saved copy if it has one, else the network (retried on a flaky connection,
+    // size-checked); the gzip is undone here as the parts arrive (the browser's own DecompressionStream), so the page
+    // only ever holds the raw data once: far less memory on a phone than joining the gzip and letting Unity unpack it
+    let VER = "";
+    function show(got, total, saved) {
+      fill.style.width = (80 * got / total) + "%";
+      note.textContent = (saved ? "loading (saved) " : "loading ") + Math.round(100 * got / total) + "%";
+    }
+    async function readPart(r, size, base, total, saved) {
+      const out = new Uint8Array(size); let at = 0;
+      for (const rd = r.body.getReader(); ;) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        if (at + value.length > size) throw new Error("bad part size");
+        out.set(value, at); at += value.length; show(base + at, total, saved);
+      }
+      if (at !== size) throw new Error("part cut short");
+      return out;
+    }
+    async function getPart(name, size, base, total, cache) {
+      const url = DIR + name;
+      if (cache) {
+        try { const hit = await cache.match(url); if (hit) return await readPart(hit, size, base, total, true); }
+        catch (e) { try { await cache.delete(url); } catch (_) {} }
+      }
+      for (let tries = 0; ; tries++) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(name + " " + r.status);
+          const b = await readPart(r, size, base, total, false);
+          if (cache) { try { await cache.put(url, new Response(b)); } catch (_) {} }
+          return b;
+        } catch (e) {
+          if (tries >= 2) throw e;
+          await new Promise(z => setTimeout(z, 1500 * (tries + 1)));
+        }
+      }
+    }
     async function dataInParts() {
       let parts;
       try { const r = await fetch(DIR + "parts.json", { cache: "no-cache" }); if (!r.ok) return false; parts = await r.json(); }
       catch (e) { return false; }
-      // the parts are named by their content, so a part kept in the browser's cache storage from a visit
-      // before is the same part: only new or changed parts are downloaded (old ones are cleared out)
+      VER = parts.v || "";
       let cache = null;
       try { cache = await caches.open("starfront-data"); } catch (e) { cache = null; }
       if (cache) {
         try { for (const k of await cache.keys()) { const n = k.url.split("/").pop(); if (!parts.files.includes(n)) await cache.delete(k); } } catch (e) {}
+        try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
       }
-      const chunks = []; let got = 0;
-      for (const name of parts.files) {
-        const url = DIR + name;
-        let r = cache ? await cache.match(url) : null;
-        const fresh = !r;
-        if (fresh) {
-          r = await fetch(url);
-          if (!r.ok) throw new Error("missing " + name);
+      const sizes = parts.sizes || [];
+      const total = parts.size;
+      if (typeof DecompressionStream !== "undefined" && sizes.length === parts.files.length) {
+        const ds = new DecompressionStream("gzip"), w = ds.writable.getWriter();
+        const out = (async () => {
+          const blobs = []; let pend = [], n = 0;
+          for (const rd = ds.readable.getReader(); ;) {
+            const { done, value } = await rd.read();
+            if (done) break;
+            pend.push(value); n += value.length;
+            if (n >= (8 << 20)) { blobs.push(new Blob(pend)); pend = []; n = 0; }
+          }
+          blobs.push(new Blob(pend));
+          return new Blob(blobs);
+        })();
+        let base = 0;
+        for (let i = 0; i < parts.files.length; i++) {
+          await w.write(await getPart(parts.files[i], sizes[i], base, total, cache));
+          base += sizes[i];
         }
-        const keep = [];
-        const reader = r.body.getReader();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value); keep.push(value); got += value.length;
-          fill.style.width = (80 * got / parts.size) + "%";
-          note.textContent = (fresh ? "loading " : "loading (saved) ") + Math.round(100 * got / parts.size) + "%";
+        await w.close();
+        config.dataUrl = URL.createObjectURL(await out);   // raw data: Unity takes it as it is
+      } else {
+        // older browsers: join the gzip and let Unity unpack it
+        const chunks = []; let base = 0;
+        for (let i = 0; i < parts.files.length; i++) {
+          const size = sizes[i] || 0;
+          let b;
+          if (size) b = await getPart(parts.files[i], size, base, total, cache);
+          else { const r = await fetch(DIR + parts.files[i]); if (!r.ok) throw new Error("missing " + parts.files[i]); b = new Uint8Array(await r.arrayBuffer()); }
+          chunks.push(b); base += b.length; show(base, total, false);
         }
-        if (fresh && cache) { try { await cache.put(url, new Response(new Blob(keep))); } catch (e) {} }
+        config.dataUrl = URL.createObjectURL(new Blob(chunks));
       }
-      config.dataUrl = URL.createObjectURL(new Blob(chunks));
       config.cacheControl = () => "no-store";   // the blob isn't a server file the loader's cache can check
+      // the code files carry the build's version, so a cached older framework never meets newer data
+      if (VER) {
+        config.frameworkUrl += "?v=" + VER;
+        if (config.codeUrl) config.codeUrl += "?v=" + VER;
+      }
       note.textContent = "starting...";
       return true;
     }
@@ -95,10 +156,12 @@
     script.src = DIR + NAME("Web.loader.js");
     script.onload = async () => {
       let split = false;
+      if (OLD) note.textContent = "This device may be too old for the game. Trying anyway...";
       try { split = await dataInParts(); } catch (e) { note.textContent = "Couldn't load: " + e.message; return; }
+      const freeBlob = () => { if (split && config.dataUrl.startsWith("blob:")) URL.revokeObjectURL(config.dataUrl); };
       createUnityInstance(canvas, config, p => { fill.style.width = (split ? 80 + 20 * p : 100 * p) + "%"; })
-        .then(() => { loading.style.display = "none"; })
-        .catch(e => { note.textContent = "Couldn't start: " + e; });
+        .then(() => { loading.style.display = "none"; freeBlob(); })
+        .catch(e => { note.textContent = "Couldn't start: " + e; freeBlob(); });
     };
     document.body.appendChild(script);
   </script>
